@@ -33,7 +33,7 @@ class DSCAnalyzerApp(tk.Tk):
             "trimmed": None, "mhc": None, "baseline_subtracted": None,
             "fit_curve": None, "final_results": None, "baseline_params": {}
         }
-        self.temp_plot_elements = []
+        self.temp_plot_elements = {'pre': [], 'post': []}
         self.selection_mode = None
         self.point_collector = []
 
@@ -226,17 +226,39 @@ class DSCAnalyzerApp(tk.Tk):
         self.update_plot("Molowa Pojemność Cieplna (MHC)")
         self.update_button_states()
 
+    # Wklej w miejsce starej metody enter_baseline_mode
     def enter_baseline_mode(self, mode):
+        """Wchodzi w tryb wyboru punktów dla linii bazowej 'pre' lub 'post'."""
         self.selection_mode = f"baseline_{mode}"
         self.point_collector = []
-        self.update_plot(self.ax.get_title(), f"Wybierz 3 punkty dla bazy '{mode}'")
+
+        # ZMIANA: Usuń poprzednie punkty i linię tylko dla TEGO trybu ('pre' lub 'post')
+        self.clear_temp_plot_elements(key=mode)
+
+        # ZMIANA: Usuwamy parametry tylko wtedy, gdy zaczynamy definiować daną bazę od nowa.
+        if mode in self.data_state['baseline_params']:
+            del self.data_state['baseline_params'][mode]
+            # Po usunięciu parametrów, musimy zaktualizować stan przycisków
+            self.update_button_states()
+
+        # ZMIANA: Zamiast przerysowywać cały wykres (co wszystko kasuje),
+        # wyświetlamy instrukcję w stopce.
+        footer_text = f"Tryb definicji bazy '{mode}': Wybierz do 3 punktów. LPM dodaje, PPM na punkcie usuwa."
+        self.fig.text(0.5, 0.01, footer_text, ha='center', color='red', fontsize=10,
+                      bbox=dict(facecolor='white', alpha=0.8, edgecolor='red'))
+        self.canvas.draw()
 
     def show_baseline(self):
         """Oblicza chemiczną linię bazową i wyświetla ją na wykresie z danymi MHC."""
+        # ... (cała logika obliczeniowa pozostaje bez zmian) ...
         df = self.data_state['mhc']
         if df is None: return messagebox.showerror("Błąd", "Najpierw skonwertuj dane na MHC.")
         if 'pre' not in self.data_state['baseline_params'] or 'post' not in self.data_state['baseline_params']:
             return messagebox.showerror("Błąd", "Zdefiniuj obie linie bazowe (przed i po piku).")
+
+        # --- Nowy początek funkcji: wyczyść tymczasowe elementy ---
+        self.selection_mode = None  # Zakończ tryb selekcji
+        self.clear_temp_plot_elements()  # Wyczyść WSZYSTKIE punkty i linie pomocnicze
 
         T, Y = df['Temp'].values, df['MHC'].values
         p_pre = self.data_state['baseline_params']['pre']['poly']
@@ -245,36 +267,25 @@ class DSCAnalyzerApp(tk.Tk):
         bas1 = np.polyval(p_pre, T)
         bas2 = np.polyval(p_post, T)
 
+        # ... (reszta funkcji bez zmian) ...
         Int_Y = cumulative_trapezoid(Y, T, initial=0)
-
         idx_pre = np.where(T < self.data_state['baseline_params']['pre']['points'][0, 0])[0]
         idx_post = np.where(T > self.data_state['baseline_params']['post']['points'][-1, 0])[0]
-
         if len(idx_pre) < 2 or len(idx_post) < 2:
             return messagebox.showerror("Błąd", "Zbyt mało punktów poza obszarem baz, aby znormalizować całkę.")
-
         I1 = np.polyfit(T[idx_pre], Int_Y[idx_pre], 1)
         Ib1 = np.polyval(I1, T)
         I2 = np.polyfit(T[idx_post], Int_Y[idx_post], 1)
         Ib2 = np.polyval(I2, T)
-
         alpha = (Int_Y - Ib1) / (Ib2 - Ib1)
         alpha = np.clip(alpha, 0, 1)
-
         final_baseline = bas1 * (1 - alpha) + bas2 * alpha
         Y_corrected = Y - final_baseline
-
-        # Obliczanie Tm i DeltaCp do wyświetlenia
         tm_index = np.argmax(Y_corrected)
         Tm = T[tm_index]
         delta_cp_at_tm = bas2[tm_index] - bas1[tm_index]
 
-        # Zapisz wyniki do stanu aplikacji
-        self.data_state['baseline_analysis'] = pd.DataFrame({
-            'Temp': T,
-            'MHC': Y,
-            'Baseline': final_baseline
-        })
+        self.data_state['baseline_analysis'] = pd.DataFrame({'Temp': T, 'MHC': Y, 'Baseline': final_baseline})
         self.data_state['delta_cp_result'] = {'Tm': Tm, 'dCp': delta_cp_at_tm}
 
         self.update_plot("Wizualizacja Linii Bazowej")
@@ -360,41 +371,77 @@ class DSCAnalyzerApp(tk.Tk):
 
     # --- Metody pomocnicze i obsługi zdarzeń ---
 
+    # Wklej w miejsce starej metody on_plot_click
     def on_plot_click(self, event):
+        """Obsługuje kliknięcia myszą na wykresie w różnych trybach selekcji."""
         if not self.selection_mode or event.inaxes != self.ax: return
 
-        self.point_collector.append((event.xdata, event.ydata))
-        pt, = self.ax.plot(event.xdata, event.ydata, 'ro', markersize=8, markerfacecolor='none')
-        self.temp_plot_elements.append(pt)
-        self.canvas.draw()
+        # --- Logika dla trybu przycinania --- (bez zmian)
+        if self.selection_mode == 'trim':
+            if event.button == 1:
+                self.point_collector.append((event.xdata, event.ydata))
+                pt, = self.ax.plot(event.xdata, event.ydata, 'go', markersize=8, markerfacecolor='none')
+                self.temp_plot_elements['pre'].append(pt)
+                self.canvas.draw()
+                if len(self.point_collector) == 2:
+                    temps = sorted([p[0] for p in self.point_collector])
+                    df_subtracted = self.data_state['subtracted']
+                    idx = (df_subtracted['Temp'] >= temps[0]) & (df_subtracted['Temp'] <= temps[1])
+                    self.data_state['trimmed'] = df_subtracted[idx].copy()
+                    self.selection_mode = None
+                    self.update_plot("Po ograniczeniu zakresu temperatur")
+                    self.update_button_states()
+            return
 
-        # Logika dla trybu przycinania
-        if self.selection_mode == 'trim' and len(self.point_collector) == 2:
-            temps = sorted([p[0] for p in self.point_collector])
-            idx = (self.data_state['subtracted']['Temp'] >= temps[0]) & (
-                        self.data_state['subtracted']['Temp'] <= temps[1])
-            self.data_state['trimmed'] = self.data_state['subtracted'][idx].copy()
-            self.selection_mode = None
-            self.update_plot("Po ograniczeniu zakresu temperatur")
-            self.update_button_states()
-
-        # Logika dla trybu definicji bazy
-        elif self.selection_mode in ['baseline_pre', 'baseline_post'] and len(self.point_collector) == 3:
+        # --- Logika dla trybu definicji bazy ---
+        if self.selection_mode in ['baseline_pre', 'baseline_post']:
             mode = self.selection_mode.split('_')[1]
-            points = np.array(self.point_collector)
-            points = points[points[:, 0].argsort()]  # Sortuj wg temperatury
 
-            p = np.polyfit(points[:, 0], points[:, 1], 2)  # Dopasowanie kwadratowe
-            self.data_state['baseline_params'][mode] = {'points': points, 'poly': p}
+            # Lewy przycisk myszy - dodaj punkt
+            if event.button == 1 and len(self.point_collector) < 3:
+                # ZMIANA: Bardziej jawny sposób rysowania pustego czerwonego kółka
+                pt, = self.ax.plot(event.xdata, event.ydata, marker='o',
+                                   markerfacecolor='none', markeredgecolor='red',
+                                   markersize=8, linestyle='None', markeredgewidth=1.5)
+                self.point_collector.append((event.xdata, event.ydata))
+                self.temp_plot_elements.setdefault(mode, []).append(pt)
+                self._update_temp_baseline_plot(mode)
 
-            x_fit = np.linspace(points[0, 0], points[-1, 0], 100)
-            y_fit = np.polyval(p, x_fit)
-            line, = self.ax.plot(x_fit, y_fit, 'r--')
-            self.temp_plot_elements.append(line)
-            self.canvas.draw()
+            # Prawy przycisk myszy - usuń kliknięty punkt
+            elif event.button == 3 and self.point_collector:
+                points_to_check = self.temp_plot_elements.get(mode, [])
+                # Szukamy tylko markerów (obiektów bez stylu linii)
+                markers = [el for el in points_to_check if isinstance(el, plt.Line2D) and el.get_linestyle() == 'None']
 
-            self.selection_mode = None
-            self.update_button_states()
+                if not markers: return
+
+                click_pos_pixels = self.ax.transData.transform((event.xdata, event.ydata))
+                point_coords = [marker.get_data() for marker in markers]
+                point_pixels = [self.ax.transData.transform(np.squeeze(p)) for p in point_coords]
+
+                distances = [np.linalg.norm(click_pos_pixels - pp) for pp in point_pixels]
+
+                min_dist_idx = np.argmin(distances)
+                if distances[min_dist_idx] < 10:  # Tolerancja 10 pikseli
+                    # Pobieramy współrzędne usuwanego punktu, aby znaleźć jego indeks w `point_collector`
+                    marker_to_remove = markers[min_dist_idx]
+                    x_to_remove, y_to_remove = marker_to_remove.get_data()
+
+                    # Znajdź indeks w liście ze współrzędnymi
+                    collector_idx = -1
+                    for i, (px, py) in enumerate(self.point_collector):
+                        if np.isclose(px, x_to_remove) and np.isclose(py, y_to_remove):
+                            collector_idx = i
+                            break
+
+                    if collector_idx != -1:
+                        # Usuń z obu list
+                        del self.point_collector[collector_idx]
+                        marker_to_remove.remove()
+                        self.temp_plot_elements[mode].remove(marker_to_remove)
+
+                        # Przerysuj linię bazową
+                        self._update_temp_baseline_plot(mode)
 
     def update_plot(self, title="", footer_text=""):
         self.clear_temp_plot_elements()
@@ -449,28 +496,57 @@ class DSCAnalyzerApp(tk.Tk):
         self.fig.tight_layout(rect=[0, 0.03, 1, 1])
         self.canvas.draw()
 
-    def clear_temp_plot_elements(self):
-        for element in self.temp_plot_elements:
-            element.remove()
-        self.temp_plot_elements.clear()
+    def clear_temp_plot_elements(self, key=None):
+        """Czyści tymczasowe elementy z wykresu."""
+        if key:
+            # Czyści elementy tylko dla danego klucza (np. 'pre' lub 'post')
+            for element in self.temp_plot_elements.get(key, []):
+                element.remove()
+            self.temp_plot_elements[key] = []
+        else:
+            # Czyści wszystkie tymczasowe elementy
+            for key_ in self.temp_plot_elements:
+                for element in self.temp_plot_elements[key_]:
+                    element.remove()
+                self.temp_plot_elements[key_] = []
+
         self.canvas.draw() if hasattr(self, 'canvas') else None
 
-    # def update_button_states(self):
-    #     """Włącza/wyłącza przyciski w zależności od stanu analizy."""
-    #     s = self.data_state
-    #     self.btn_subtract['state'] = 'normal' if (
-    #                 s['sample_raw'] is not None and s['buffer_raw'] is not None) else 'disabled'
-    #     self.btn_trim['state'] = 'normal' if s['subtracted'] is not None else 'disabled'
-    #     self.btn_convert['state'] = 'normal' if s['trimmed'] is not None else 'disabled'
-    #     self.btn_base_pre['state'] = 'normal' if s['mhc'] is not None else 'disabled'
-    #     self.btn_base_post['state'] = 'normal' if s['mhc'] is not None else 'disabled'
-    #     self.btn_calc_base['state'] = 'normal' if 'pre' in s['baseline_params'] and 'post' in s[
-    #         'baseline_params'] else 'disabled'
-    #     self.btn_fit['state'] = 'normal' if s['baseline_subtracted'] is not None else 'disabled'
-    #     self.btn_save['state'] = 'normal' if any(s.values()) else 'disabled'
+    # Wklej w miejsce starej metody _update_temp_baseline_plot
+    # Wklej w miejsce starej metody _update_temp_baseline_plot
+    def _update_temp_baseline_plot(self, mode):
+        """Aktualizuje tymczasowy wykres linii bazowej (liniowej dla 2 pkt, kwadratowej dla 3)."""
+        # KROK 1: Usuń starą linię przerywaną, ale zostaw punkty (markery).
+        # ZMIANA: Wyszukujemy obiekty, które są liniami (mają styl '--'), a nie markerami (których styl linii to 'None').
+        # To jest kluczowa poprawka.
+        elements_in_mode = self.temp_plot_elements.get(mode, [])
+        old_lines = [el for el in elements_in_mode if isinstance(el, plt.Line2D) and el.get_linestyle() != 'None']
+        for line in old_lines:
+            line.remove()
+            self.temp_plot_elements[mode].remove(line)
 
+        points = np.array(self.point_collector)
+        if len(points) < 2:
+            self.canvas.draw()
+            return
 
-# Wklej tę poprawioną funkcję w miejsce starej w pliku analyzer_gui.py
+        # KROK 2: Dopasuj model (bez zmian)
+        points = points[points[:, 0].argsort()]
+        poly_deg = 1 if len(points) == 2 else 2
+        p = np.polyfit(points[:, 0], points[:, 1], poly_deg)
+
+        # KROK 3: Narysuj nową linię przerywaną (bez zmian)
+        x_fit = np.linspace(points[0, 0], points[-1, 0], 100)
+        y_fit = np.polyval(p, x_fit)
+        line, = self.ax.plot(x_fit, y_fit, 'r--')
+        self.temp_plot_elements[mode].append(line)
+
+        # KROK 4: Zapisz parametry (bez zmian)
+        if len(points) == 3:
+            self.data_state['baseline_params'][mode] = {'points': points, 'poly': p}
+            self.update_button_states()
+
+        self.canvas.draw()
 
     def update_button_states(self):
         """Włącza/wyłącza przyciski w zależności od stanu analizy."""
