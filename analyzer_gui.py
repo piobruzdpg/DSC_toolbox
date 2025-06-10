@@ -34,6 +34,11 @@ class DSCAnalyzerApp(tk.Tk):
             "fit_curve": None, "final_results": None, "baseline_params": {}
         }
         self.temp_plot_elements = {'pre': [], 'post': []}
+        # NOWA LINIA: Dodajemy "uchwyt" do tekstu w stopce, aby móc go usuwać
+        self.footer_text_artist = None
+        self.selection_mode = None
+        self.point_collector = []
+
         self.selection_mode = None
         self.point_collector = []
 
@@ -244,8 +249,9 @@ class DSCAnalyzerApp(tk.Tk):
         # ZMIANA: Zamiast przerysowywać cały wykres (co wszystko kasuje),
         # wyświetlamy instrukcję w stopce.
         footer_text = f"Tryb definicji bazy '{mode}': Wybierz do 3 punktów. LPM dodaje, PPM na punkcie usuwa."
-        self.fig.text(0.5, 0.01, footer_text, ha='center', color='red', fontsize=10,
-                      bbox=dict(facecolor='white', alpha=0.8, edgecolor='red'))
+        #self.fig.text(0.5, 0.01, footer_text, ha='center', color='red', fontsize=10,
+        #              bbox=dict(facecolor='white', alpha=0.8, edgecolor='red'))
+        self._update_footer_text(footer_text, color="red")
         self.canvas.draw()
 
     def show_baseline(self):
@@ -336,8 +342,11 @@ class DSCAnalyzerApp(tk.Tk):
         self.update_plot("Wynik dopasowania modelu")
         self.update_button_states()
 
+    # Wklej w miejsce starej metody save_report
     def save_report(self):
-        if not any(self.data_state.values()):
+        # ZMIANA: Sprawdzamy jawnie, czy jakakolwiek wartość w słowniku nie jest 'None',
+        # co jest jednoznaczne dla obiektów DataFrame i innych.
+        if not any(value is not None for value in self.data_state.values()):
             return messagebox.showwarning("Brak danych", "Brak danych do zapisania.")
 
         filepath = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Plik Excel", "*.xlsx")])
@@ -345,6 +354,8 @@ class DSCAnalyzerApp(tk.Tk):
 
         try:
             with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
+                # Reszta kodu pozostaje bez zmian, ponieważ tutaj już poprawnie
+                # sprawdzany jest każdy element z osobna (if self.data_state[...] is not None)
                 if self.data_state['sample_raw'] is not None:
                     self.data_state['sample_raw'].to_excel(writer, sheet_name='Dane Surowe (Próbka)', index=False)
                 if self.data_state['buffer_raw'] is not None:
@@ -355,8 +366,8 @@ class DSCAnalyzerApp(tk.Tk):
                     self.data_state['trimmed'].to_excel(writer, sheet_name='Po przycięciu', index=False)
                 if self.data_state['mhc'] is not None:
                     self.data_state['mhc'].to_excel(writer, sheet_name='Molowa Pojemnosc Cieplna', index=False)
-                if self.data_state['baseline_subtracted'] is not None:
-                    self.data_state['baseline_subtracted'].to_excel(writer, sheet_name='Po odjęciu bazy', index=False)
+                if self.data_state.get('peak_only') is not None:  # Używamy .get() dla bezpieczeństwa
+                    self.data_state['peak_only'].to_excel(writer, sheet_name='Po odjęciu bazy', index=False)
                 if self.data_state['fit_curve'] is not None:
                     self.data_state['fit_curve'].to_excel(writer, sheet_name='Dopasowany model', index=False)
                 if self.data_state['final_results'] is not None:
@@ -492,7 +503,8 @@ class DSCAnalyzerApp(tk.Tk):
         self.ax.set_xlabel("Temperatura [°C]")
         self.ax.set_ylabel("Sygnał")
         self.ax.grid(True)
-        self.fig.text(0.5, 0.01, footer_text, ha='center', color='blue', fontsize=9)
+        #self.fig.text(0.5, 0.01, footer_text, ha='center', color='blue', fontsize=9)
+        self._update_footer_text(footer_text, color="blue")
         self.fig.tight_layout(rect=[0, 0.03, 1, 1])
         self.canvas.draw()
 
@@ -547,6 +559,29 @@ class DSCAnalyzerApp(tk.Tk):
             self.update_button_states()
 
         self.canvas.draw()
+
+    # NOWA METODA POMOCNICZA: Wklej ją w całości do klasy DSCAnalyzerApp
+    def _update_footer_text(self, text="", color="blue"):
+        """Usuwa stary tekst stopki i rysuje nowy, zarządzając jego obiektem."""
+        # Krok 1: Usuń poprzedni tekst, jeśli istnieje
+        if self.footer_text_artist:
+            self.footer_text_artist.remove()
+
+        # Krok 2: Stwórz nowy obiekt tekstowy i zapisz go w self.footer_text_artist
+        # Rysujemy tekst tylko wtedy, gdy nie jest pusty.
+        if text:
+            # Czerwony tekst (ostrzeżenie/instrukcja) będzie miał tło dla lepszej widoczności
+            bbox_props = dict(boxstyle='round', facecolor='white', alpha=0.8,
+                              edgecolor=color) if color == 'red' else None
+            self.footer_text_artist = self.fig.text(
+                0.5, 0.01, text, ha='center', color=color, fontsize=9, bbox=bbox_props
+            )
+        else:
+            # Jeśli tekst jest pusty, po prostu czyścimy referencję
+            self.footer_text_artist = None
+
+        # Krok 3: Odśwież wykres
+        self.canvas.draw_idle()
 
     def update_button_states(self):
         """Włącza/wyłącza przyciski w zależności od stanu analizy."""
