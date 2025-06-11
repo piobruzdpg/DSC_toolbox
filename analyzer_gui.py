@@ -9,6 +9,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from scipy.interpolate import interp1d
 from scipy.optimize import curve_fit
 from scipy.integrate import cumulative_trapezoid
+from scipy.signal import savgol_filter # <-- Nowy import
 
 # Import modeli z naszego wcześniej stworzonego pliku
 try:
@@ -31,14 +32,11 @@ class DSCAnalyzerApp(tk.Tk):
         self.data_state = {
             "sample_raw": None, "buffer_raw": None, "subtracted": None,
             "trimmed": None, "mhc": None, "baseline_subtracted": None,
+            # Zmieniono 'peak_only' na 'baseline_subtracted' dla spójności
             "fit_curve": None, "final_results": None, "baseline_params": {}
         }
         self.temp_plot_elements = {'pre': [], 'post': []}
-        # NOWA LINIA: Dodajemy "uchwyt" do tekstu w stopce, aby móc go usuwać
         self.footer_text_artist = None
-        self.selection_mode = None
-        self.point_collector = []
-
         self.selection_mode = None
         self.point_collector = []
 
@@ -93,10 +91,10 @@ class DSCAnalyzerApp(tk.Tk):
         frame2.pack(fill=tk.X, padx=5, pady=5)
         self.param_vars = {}
         params_list = {
-            "Masa mol. [kDa]": ("14.0", "mass_kda"),
+            "Masa mol. [kDa]": ("14.307", "mass_kda"),
             "V celki [mL]": ("0.299", "vol_ml"),
             "Stężenie [mg/mL]": ("1.0", "conc_mgml"),
-            "V skan. [°C/min]": ("60.0", "rate_cpmin")
+            "V skan. [°C/min]": ("1.0", "rate_cpmin")
         }
         for i, (text, (default, key)) in enumerate(params_list.items()):
             label = ttk.Label(frame2, text=text)
@@ -171,10 +169,16 @@ class DSCAnalyzerApp(tk.Tk):
             filetypes=[("Pliki CSV", "*.csv"), ("Pliki tekstowe", "*.txt"), ("Wszystkie pliki", "*.*")])
         if not filepath: return
         try:
+            # Używamy pandas do wczytania, aby obsłużyć różne formaty CSV
+            # Zakładamy, że pierwsza kolumna to Temp, druga to Signal.
+            # Zmieniamy header=None na header='infer' jeśli pliki mają nagłówki,
+            # lub odpowiednio ustawiamy numery kolumn.
+            # Ważne: Jeśli formatowanie plików różni się (np. separator, brak nagłówków),
+            # to trzeba dopasować ten fragment kodu.
             df = pd.read_csv(filepath, header=None, names=['Temp', 'Signal'], comment='#', skipinitialspace=True)
             self.data_state[target] = df
             getattr(self, f"lbl_{target.split('_')[0]}_file").config(text=filepath.split('/')[-1])
-            self.update_plot(f"Wczytano: {target}")
+            self.update_plot(f"Wczytano: {target.replace('_raw', '')}")
             self.update_button_states()
         except Exception as e:
             messagebox.showerror("Błąd odczytu pliku", f"Nie udało się wczytać pliku: {e}")
@@ -188,6 +192,10 @@ class DSCAnalyzerApp(tk.Tk):
     def subtract_buffer(self):
         sample = self.data_state["sample_raw"]
         buffer = self.data_state["buffer_raw"]
+        if sample is None or buffer is None:
+            messagebox.showerror("Błąd", "Wczytaj najpierw pliki próbki i bufora.")
+            return
+
         interp_func = interp1d(buffer['Temp'], buffer['Signal'], bounds_error=False, fill_value="extrapolate")
         interpolated_buffer_signal = interp_func(sample['Temp'])
 
@@ -200,6 +208,11 @@ class DSCAnalyzerApp(tk.Tk):
         self.update_button_states()
 
     def enter_trim_mode(self):
+        current_data = self.data_state.get('subtracted')
+        if current_data is None:
+            messagebox.showerror("Błąd", "Najpierw odejmij bufor.")
+            return
+
         self.selection_mode = 'trim'
         self.point_collector = []
         self.clear_temp_plot_elements()
@@ -216,80 +229,114 @@ class DSCAnalyzerApp(tk.Tk):
         except ValueError:
             return messagebox.showerror("Błąd", "Wprowadź poprawne wartości liczbowe w parametrach.")
 
-        mass_g = (params['conc_mgml'] * params['vol_ml']) / 1000.0
-        molar_mass_g_mol = params['mass_kda'] * 1000.0
-        moles = mass_g / molar_mass_g_mol
+        # Przeliczanie stężenia mg/mL na mole
+        # Zakładamy, że Masa mol. [kDa] jest w kDa, więc mnożymy przez 1000, aby uzyskać g/mol
+        # Stężenie [mg/mL] dzielimy przez 1000, aby uzyskać g/mL
+        # V celki [mL] dzielimy przez 1000, aby uzyskać L
+        # moles = (stężenie w g/mL * objętość w L) / masa molowa w g/mol
+        protein_conc_g_ml = params['conc_mgml'] / 1000.0  # g/mL
+        cell_volume_L = params['vol_ml'] / 1000.0  # L
+        molar_mass_g_mol = params['mass_kda'] * 1000.0  # g/mol
+        moles = (protein_conc_g_ml * cell_volume_L) / molar_mass_g_mol  # moles
 
         rate_K_s = params['rate_cpmin'] / 60.0
 
-        # P [µJ/s] -> Cp [J/mol·K]
-        signal_J_s = df['Signal'] / 1_000_000.0
-        cp_J_K = signal_J_s / rate_K_s
-        mhc_J_molK = cp_J_K / moles
+        # P [µW] (zakładana jednostka surowego sygnału)
+        # uW = uJ/s
+        # P [uJ/s] -> Cp [J/mol·K]
+        # Sygnał po odjęciu bufora i przycięciu jest w µW
+        # Zakładamy, że self.data_state['trimmed']['Signal'] jest w µW
+        signal_uJ_s = df['Signal']
+        cp_uJ_K = signal_uJ_s / rate_K_s  # [uJ/s] / [K/s] = [uJ/K]
+        mhc_uJ_molK = cp_uJ_K / moles  # [uJ/K] / [mol] = [uJ/(mol·K)]
+
+        # Konwersja z uJ/(mol·K) na J/(mol·K)
+        mhc_J_molK = mhc_uJ_molK / 1e9  # [J/(mol·K)]
 
         self.data_state['mhc'] = pd.DataFrame({'Temp': df['Temp'], 'MHC': mhc_J_molK})
         self.update_plot("Molowa Pojemność Cieplna (MHC)")
         self.update_button_states()
 
-    # Wklej w miejsce starej metody enter_baseline_mode
     def enter_baseline_mode(self, mode):
         """Wchodzi w tryb wyboru punktów dla linii bazowej 'pre' lub 'post'."""
+        if self.data_state.get('mhc') is None:
+            messagebox.showerror("Błąd", "Najpierw skonwertuj dane na MHC.")
+            return
+
         self.selection_mode = f"baseline_{mode}"
         self.point_collector = []
 
-        # ZMIANA: Usuń poprzednie punkty i linię tylko dla TEGO trybu ('pre' lub 'post')
         self.clear_temp_plot_elements(key=mode)
 
-        # ZMIANA: Usuwamy parametry tylko wtedy, gdy zaczynamy definiować daną bazę od nowa.
         if mode in self.data_state['baseline_params']:
             del self.data_state['baseline_params'][mode]
-            # Po usunięciu parametrów, musimy zaktualizować stan przycisków
             self.update_button_states()
 
-        # ZMIANA: Zamiast przerysowywać cały wykres (co wszystko kasuje),
-        # wyświetlamy instrukcję w stopce.
         footer_text = f"Tryb definicji bazy '{mode}': Wybierz do 3 punktów. LPM dodaje, PPM na punkcie usuwa."
-        #self.fig.text(0.5, 0.01, footer_text, ha='center', color='red', fontsize=10,
-        #              bbox=dict(facecolor='white', alpha=0.8, edgecolor='red'))
         self._update_footer_text(footer_text, color="red")
         self.canvas.draw()
 
     def show_baseline(self):
         """Oblicza chemiczną linię bazową i wyświetla ją na wykresie z danymi MHC."""
-        # ... (cała logika obliczeniowa pozostaje bez zmian) ...
         df = self.data_state['mhc']
-        if df is None: return messagebox.showerror("Błąd", "Najpierw skonwertuj dane na MHC.")
+        if df is None:
+            return messagebox.showerror("Błąd", "Najpierw skonwertuj dane na MHC.")
         if 'pre' not in self.data_state['baseline_params'] or 'post' not in self.data_state['baseline_params']:
             return messagebox.showerror("Błąd", "Zdefiniuj obie linie bazowe (przed i po piku).")
 
-        # --- Nowy początek funkcji: wyczyść tymczasowe elementy ---
-        self.selection_mode = None  # Zakończ tryb selekcji
-        self.clear_temp_plot_elements()  # Wyczyść WSZYSTKIE punkty i linie pomocnicze
+        self.selection_mode = None
+        self.clear_temp_plot_elements()
 
         T, Y = df['Temp'].values, df['MHC'].values
+
         p_pre = self.data_state['baseline_params']['pre']['poly']
         p_post = self.data_state['baseline_params']['post']['poly']
 
         bas1 = np.polyval(p_pre, T)
         bas2 = np.polyval(p_post, T)
 
-        # ... (reszta funkcji bez zmian) ...
-        Int_Y = cumulative_trapezoid(Y, T, initial=0)
-        idx_pre = np.where(T < self.data_state['baseline_params']['pre']['points'][0, 0])[0]
-        idx_post = np.where(T > self.data_state['baseline_params']['post']['points'][-1, 0])[0]
-        if len(idx_pre) < 2 or len(idx_post) < 2:
-            return messagebox.showerror("Błąd", "Zbyt mało punktów poza obszarem baz, aby znormalizować całkę.")
-        I1 = np.polyfit(T[idx_pre], Int_Y[idx_pre], 1)
-        Ib1 = np.polyval(I1, T)
-        I2 = np.polyfit(T[idx_post], Int_Y[idx_post], 1)
-        Ib2 = np.polyval(I2, T)
-        alpha = (Int_Y - Ib1) / (Ib2 - Ib1)
-        alpha = np.clip(alpha, 0, 1)
-        final_baseline = bas1 * (1 - alpha) + bas2 * alpha
-        Y_corrected = Y - final_baseline
-        tm_index = np.argmax(Y_corrected)
+        lower_boundary = np.minimum(bas1, bas2)
+        upper_boundary = np.maximum(bas1, bas2)
+        delta = upper_boundary - lower_boundary
+
+        # --- KLUCZOWA POPRAWKA ZGODNIE Z PAŃSKĄ SUGESTIĄ ---
+        # Aby zagwarantować, że całka będzie monotonicznie rosnąca, przesuwamy
+        # całą krzywą Y w górę, tak aby jej minimum znalazło się w punkcie 0.
+        # To rozwiązuje problem ujemnych wartości w danych wejściowych do całkowania.
+        Y_for_integration = Y - np.min(Y)
+
+        # Całkujemy teraz przesuniętą, zawsze nieujemną krzywą.
+        Int_Y = cumulative_trapezoid(Y_for_integration, T, initial=0)
+
+        window_length = 51
+        polyorder = 3
+
+        if len(Int_Y) < window_length:
+            messagebox.showwarning("Wygładzanie",
+                                   f"Zbyt mało punktów ({len(Int_Y)}) dla filtru Savitzky-Golay. Wygładzanie pominięto.")
+            smoothed_int_y = Int_Y
+        else:
+            smoothed_int_y = savgol_filter(Int_Y, window_length, polyorder)
+
+        min_smoothed_int_y = np.min(smoothed_int_y)
+        max_smoothed_int_y = np.max(smoothed_int_y)
+
+        if np.isclose(max_smoothed_int_y, min_smoothed_int_y):
+            fraction = np.zeros_like(T)
+        else:
+            fraction = (smoothed_int_y - min_smoothed_int_y) / (max_smoothed_int_y - min_smoothed_int_y)
+            fraction = np.clip(fraction, 0, 1)
+
+        # Poprzednia poprawka na odwracanie 'fraction' nie jest już potrzebna,
+        # ponieważ całka z 'Y_for_integration' zawsze będzie rosnąca.
+
+        final_baseline = lower_boundary + fraction * delta
+
+        # Wyszukiwanie Tm - znajdujemy maksymalną odległość między danymi a nową linią bazową
+        Y_corrected_temp = Y - final_baseline
+        tm_index = np.argmax(np.abs(Y_corrected_temp))  # Szukamy max odległości (wartość absolutna)
         Tm = T[tm_index]
-        delta_cp_at_tm = bas2[tm_index] - bas1[tm_index]
+        delta_cp_at_tm = upper_boundary[tm_index] - lower_boundary[tm_index]
 
         self.data_state['baseline_analysis'] = pd.DataFrame({'Temp': T, 'MHC': Y, 'Baseline': final_baseline})
         self.data_state['delta_cp_result'] = {'Tm': Tm, 'dCp': delta_cp_at_tm}
@@ -298,7 +345,7 @@ class DSCAnalyzerApp(tk.Tk):
         self.update_button_states()
 
     def subtract_baseline(self):
-        """Odejmuje wcześniej obliczoną linię bazową od danych."""
+        """Odejmuje wcześniej obliczoną linię bazową od danych i oblicza parametry termodynamiczne."""
         df_analysis = self.data_state.get('baseline_analysis')
         if df_analysis is None:
             return messagebox.showerror("Błąd", "Najpierw oblicz i pokaż linię bazową.")
@@ -306,16 +353,36 @@ class DSCAnalyzerApp(tk.Tk):
         T = df_analysis['Temp'].values
         Y = df_analysis['MHC'].values
         baseline = df_analysis['Baseline'].values
-        Y_corrected = Y - baseline
+        Y_corrected = Y - baseline  # Sygnał po odjęciu bazy, w J/(mol·K)
 
-        self.data_state['peak_only'] = pd.DataFrame({'Temp': T, 'MHC_corr': Y_corrected})
+        # Zapisujemy dane piku do dalszej analizy i wykresów
+        self.data_state['baseline_subtracted'] = pd.DataFrame({'Temp': T, 'MHC_corr': Y_corrected})
+
+        # --- NOWA CZĘŚĆ: OBLICZENIE I ZAPIS PARAMETRÓW ---
+
+        # 1. Obliczamy entalpię van't Hoffa (pole pod pikiem)
+        #    np.trapz(y, x) -> całka z Cp dT ma jednostki [J/(mol·K)] * [K] = [J/mol]
+        delta_h_vh = np.trapz(Y_corrected, T)
+
+        # 2. Pobieramy wcześniej obliczone Tm i dCp
+        dcp_res = self.data_state['delta_cp_result']
+
+        # 3. Zapisujemy wszystkie trzy parametry w jednym miejscu dla łatwego dostępu
+        final_params = {
+            'Tm': dcp_res['Tm'],
+            'dCp': dcp_res['dCp'],  # w J/mol·K
+            'dH_vH': delta_h_vh  # w J/mol
+        }
+        self.data_state['final_thermo_params'] = final_params
+        # --- KONIEC NOWEJ CZĘŚCI ---
 
         self.update_plot("Pik po odjęciu linii bazowej")
         self.update_button_states()
 
     def fit_model(self):
         """Dopasowuje model do piku po odjęciu linii bazowej."""
-        df = self.data_state.get('peak_only')
+        # Używamy zmienionej nazwy klucza
+        df = self.data_state.get('baseline_subtracted')
         if df is None:
             return messagebox.showerror("Błąd", "Najpierw odejmij linię bazową.")
 
@@ -323,7 +390,7 @@ class DSCAnalyzerApp(tk.Tk):
         if not model_name: return messagebox.showerror("Błąd", "Wybierz model do dopasowania.")
 
         T = df['Temp'].values
-        Cpex = df['MHC_corr'].values * 0.239006  # Konwersja J do cal dla modeli
+        Cpex = df['MHC_corr'].values  # Już w J/(mol·K), bez konwersji na cal
 
         fit_function_map = {
             'equilibrium': dsc_models.fit_equilibrium,
@@ -331,21 +398,17 @@ class DSCAnalyzerApp(tk.Tk):
             'irreversible': lambda t, y: dsc_models.fit_irreversible(t, y, float(self.param_vars['rate_cpmin'].get()))
         }
 
-        params, metrics, fit_curve_cal = fit_function_map[model_name](T, Cpex)
+        params, metrics, fit_curve_J = fit_function_map[model_name](T, Cpex)  # fit_curve_J jest już w J/(mol·K)
 
         if params is None: return  # Błąd dopasowania już został wyświetlony
 
-        fit_curve_J = fit_curve_cal / 0.239006  # Konwersja z powrotem do J
         self.data_state['fit_curve'] = pd.DataFrame({'Temp': T, 'Fit': fit_curve_J})
         self.data_state['final_results'] = {'parameters': params, 'metrics': metrics}
 
         self.update_plot("Wynik dopasowania modelu")
         self.update_button_states()
 
-    # Wklej w miejsce starej metody save_report
     def save_report(self):
-        # ZMIANA: Sprawdzamy jawnie, czy jakakolwiek wartość w słowniku nie jest 'None',
-        # co jest jednoznaczne dla obiektów DataFrame i innych.
         if not any(value is not None for value in self.data_state.values()):
             return messagebox.showwarning("Brak danych", "Brak danych do zapisania.")
 
@@ -354,8 +417,6 @@ class DSCAnalyzerApp(tk.Tk):
 
         try:
             with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
-                # Reszta kodu pozostaje bez zmian, ponieważ tutaj już poprawnie
-                # sprawdzany jest każdy element z osobna (if self.data_state[...] is not None)
                 if self.data_state['sample_raw'] is not None:
                     self.data_state['sample_raw'].to_excel(writer, sheet_name='Dane Surowe (Próbka)', index=False)
                 if self.data_state['buffer_raw'] is not None:
@@ -366,8 +427,10 @@ class DSCAnalyzerApp(tk.Tk):
                     self.data_state['trimmed'].to_excel(writer, sheet_name='Po przycięciu', index=False)
                 if self.data_state['mhc'] is not None:
                     self.data_state['mhc'].to_excel(writer, sheet_name='Molowa Pojemnosc Cieplna', index=False)
-                if self.data_state.get('peak_only') is not None:  # Używamy .get() dla bezpieczeństwa
-                    self.data_state['peak_only'].to_excel(writer, sheet_name='Po odjęciu bazy', index=False)
+                # Zmieniono klucz dostępu do danych
+                if self.data_state.get('baseline_subtracted') is not None:
+                    self.data_state['baseline_subtracted'].to_excel(writer, sheet_name='Pik po odjeciu bazy',
+                                                                    index=False)  # Zmieniono nazwę arkusza
                 if self.data_state['fit_curve'] is not None:
                     self.data_state['fit_curve'].to_excel(writer, sheet_name='Dopasowany model', index=False)
                 if self.data_state['final_results'] is not None:
@@ -375,24 +438,42 @@ class DSCAnalyzerApp(tk.Tk):
                                                        columns=['Wartość'])
                     metrics_df = pd.DataFrame.from_dict(self.data_state['final_results']['metrics'], orient='index',
                                                         columns=['Wartość'])
-                    pd.concat([params_df, metrics_df]).to_excel(writer, sheet_name='Wyniki Końcowe')
+                    # Konwersja parametrów DH i Ea do kJ/mol dla raportu
+                    report_params_df = params_df.copy()
+                    if 'dH [J/mol]' in report_params_df.index:
+                        report_params_df.loc['dH [kJ/mol]'] = report_params_df.loc['dH [J/mol]'] / 1000
+                        report_params_df = report_params_df.drop(index='dH [J/mol]')
+                    if 'Ea [J/mol]' in report_params_df.index:
+                        report_params_df.loc['Ea [kJ/mol]'] = report_params_df.loc['Ea [J/mol]'] / 1000
+                        report_params_df = report_params_df.drop(index='Ea [J/mol]')
+
+                    combined_df = pd.concat([report_params_df, metrics_df])  # Używamy przekonwertowanych parametrów
+
+                    # Dodaj wyniki Tm i dCp z analizy linii bazowej, jeśli dostępne
+                    if 'delta_cp_result' in self.data_state and self.data_state['delta_cp_result'] is not None:
+                        dcp_res = self.data_state['delta_cp_result']
+                        dcp_df = pd.DataFrame({
+                            'Wartość': [dcp_res['Tm'], dcp_res['dCp'] / 1000]  # dCp do kJ/molK
+                        }, index=['Tm (baseline) [°C]', 'ΔCp (baseline) [kJ/mol·K]'])
+                        combined_df = pd.concat([combined_df, dcp_df])
+
+                    combined_df.to_excel(writer, sheet_name='Wyniki Końcowe (Dopasowanie)')
             messagebox.showinfo("Sukces", f"Zapisano raport w pliku:\n{filepath}")
         except Exception as e:
             messagebox.showerror("Błąd zapisu", f"Nie udało się zapisać raportu: {e}")
 
     # --- Metody pomocnicze i obsługi zdarzeń ---
 
-    # Wklej w miejsce starej metody on_plot_click
     def on_plot_click(self, event):
         """Obsługuje kliknięcia myszą na wykresie w różnych trybach selekcji."""
         if not self.selection_mode or event.inaxes != self.ax: return
 
-        # --- Logika dla trybu przycinania --- (bez zmian)
         if self.selection_mode == 'trim':
             if event.button == 1:
                 self.point_collector.append((event.xdata, event.ydata))
                 pt, = self.ax.plot(event.xdata, event.ydata, 'go', markersize=8, markerfacecolor='none')
-                self.temp_plot_elements['pre'].append(pt)
+                self.temp_plot_elements['pre'].append(
+                    pt)  # Używamy 'pre' dla temp_plot_elements by śledzić punkty przycinania
                 self.canvas.draw()
                 if len(self.point_collector) == 2:
                     temps = sorted([p[0] for p in self.point_collector])
@@ -404,13 +485,10 @@ class DSCAnalyzerApp(tk.Tk):
                     self.update_button_states()
             return
 
-        # --- Logika dla trybu definicji bazy ---
         if self.selection_mode in ['baseline_pre', 'baseline_post']:
             mode = self.selection_mode.split('_')[1]
 
-            # Lewy przycisk myszy - dodaj punkt
             if event.button == 1 and len(self.point_collector) < 3:
-                # ZMIANA: Bardziej jawny sposób rysowania pustego czerwonego kółka
                 pt, = self.ax.plot(event.xdata, event.ydata, marker='o',
                                    markerfacecolor='none', markeredgecolor='red',
                                    markersize=8, linestyle='None', markeredgewidth=1.5)
@@ -418,10 +496,8 @@ class DSCAnalyzerApp(tk.Tk):
                 self.temp_plot_elements.setdefault(mode, []).append(pt)
                 self._update_temp_baseline_plot(mode)
 
-            # Prawy przycisk myszy - usuń kliknięty punkt
             elif event.button == 3 and self.point_collector:
                 points_to_check = self.temp_plot_elements.get(mode, [])
-                # Szukamy tylko markerów (obiektów bez stylu linii)
                 markers = [el for el in points_to_check if isinstance(el, plt.Line2D) and el.get_linestyle() == 'None']
 
                 if not markers: return
@@ -433,12 +509,10 @@ class DSCAnalyzerApp(tk.Tk):
                 distances = [np.linalg.norm(click_pos_pixels - pp) for pp in point_pixels]
 
                 min_dist_idx = np.argmin(distances)
-                if distances[min_dist_idx] < 10:  # Tolerancja 10 pikseli
-                    # Pobieramy współrzędne usuwanego punktu, aby znaleźć jego indeks w `point_collector`
+                if distances[min_dist_idx] < 10:
                     marker_to_remove = markers[min_dist_idx]
                     x_to_remove, y_to_remove = marker_to_remove.get_data()
 
-                    # Znajdź indeks w liście ze współrzędnymi
                     collector_idx = -1
                     for i, (px, py) in enumerate(self.point_collector):
                         if np.isclose(px, x_to_remove) and np.isclose(py, y_to_remove):
@@ -446,51 +520,84 @@ class DSCAnalyzerApp(tk.Tk):
                             break
 
                     if collector_idx != -1:
-                        # Usuń z obu list
                         del self.point_collector[collector_idx]
                         marker_to_remove.remove()
                         self.temp_plot_elements[mode].remove(marker_to_remove)
 
-                        # Przerysuj linię bazową
                         self._update_temp_baseline_plot(mode)
 
     def update_plot(self, title="", footer_text=""):
         self.clear_temp_plot_elements()
         self.ax.clear()
 
-        # Logika decydująca co narysować, w kolejności od ostatniego etapu
+        current_ylabel = "Sygnał [uW]"
+
         if self.data_state['fit_curve'] is not None:
-            df_peak = self.data_state['peak_only']
+            df_peak = self.data_state['baseline_subtracted']
             df_fit = self.data_state['fit_curve']
             self.ax.plot(df_peak['Temp'], df_peak['MHC_corr'], 'ro', markersize=3, alpha=0.6, label="Dane")
             self.ax.plot(df_fit['Temp'], df_fit['Fit'], 'b-', linewidth=2, label="Dopasowany model")
             self.ax.legend()
-        elif self.data_state.get('peak_only') is not None:
-            df = self.data_state['peak_only']
+            current_ylabel = "Pojemność cieplna [J/(mol·K)]"
+
+        elif self.data_state.get('baseline_subtracted') is not None:
+            df = self.data_state['baseline_subtracted']
             self.ax.plot(df['Temp'], df['MHC_corr'], 'b-', label="Sygnał po odjęciu bazy")
-            self.ax.legend()
+
+            # --- NOWA CZĘŚĆ: DODAWANIE POLA TEKSTOWEGO Z WYNIKAMI ---
+            if self.data_state.get('final_thermo_params') is not None:
+                params = self.data_state['final_thermo_params']
+
+                # Pobieramy i formatujemy wartości (konwersja na kJ dla czytelności)
+                tm_val = params['Tm']
+                dcp_val_kj = params['dCp'] / 1000  # z J/mol·K na kJ/mol·K
+                dh_val_kj = params['dH_vH'] / 1000  # z J/mol na kJ/mol
+
+                # Tworzymy tekst z użyciem formatowania LaTeX
+                text_str = (
+                    f"$T_m$ = {tm_val:.2f} °C\n"
+                    f"$\\Delta C_p$ = {dcp_val_kj:.2f} kJ/mol·K\n"
+                    f"$\\Delta H_{{vH}}$ = {dh_val_kj:.2f} kJ/mol"
+                )
+
+                # Rysujemy pole tekstowe w prawym górnym rogu wykresu
+                self.ax.text(0.95, 0.95, text_str, transform=self.ax.transAxes, fontsize=11,
+                             verticalalignment='top', horizontalalignment='right',
+                             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
+            # --- KONIEC NOWEJ CZĘŚCI ---
+
+            self.ax.legend(loc='lower center')
+            current_ylabel = "Pojemność cieplna [J/(mol·K)]"
+
         elif self.data_state.get('baseline_analysis') is not None:
             df = self.data_state['baseline_analysis']
             self.ax.plot(df['Temp'], df['MHC'], label="Molowa Poj. Cieplna")
             self.ax.plot(df['Temp'], df['Baseline'], 'r--', label="Obliczona linia bazowa")
-            # Dodanie pola tekstowego z DeltaCp
             dcp_res = self.data_state['delta_cp_result']
-            text_str = f"Tm = {dcp_res['Tm']:.2f} °C\nΔCp = {dcp_res['dCp']:.2f} J/mol·K"
+            text_str = f"$T_m$ = {dcp_res['Tm']:.2f} °C\n$\\Delta C_p$ = {dcp_res['dCp'] / 1000:.2f} kJ/mol·K"
             self.ax.text(0.05, 0.95, text_str, transform=self.ax.transAxes, fontsize=10,
                          verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
             self.ax.legend()
+            current_ylabel = "Pojemność cieplna [J/(mol·K)]"
+
         elif self.data_state['mhc'] is not None:
             df = self.data_state['mhc']
             self.ax.plot(df['Temp'], df['MHC'], label="Molowa Poj. Cieplna")
             self.ax.legend()
+            current_ylabel = "Pojemność cieplna [J/(mol·K)]"
+
         elif self.data_state['trimmed'] is not None:
             df = self.data_state['trimmed']
             self.ax.plot(df['Temp'], df['Signal'], label="Sygnał po przycięciu")
             self.ax.legend()
+            current_ylabel = "Sygnał [uW]"
+
         elif self.data_state['subtracted'] is not None:
             df = self.data_state['subtracted']
             self.ax.plot(df['Temp'], df['Signal'], label="Sygnał po odjęciu bufora")
             self.ax.legend()
+            current_ylabel = "Sygnał [uW]"
+
         elif self.data_state['sample_raw'] is not None:
             df = self.data_state['sample_raw']
             self.ax.plot(df['Temp'], df['Signal'], label="Surowy sygnał (próbka)")
@@ -498,12 +605,12 @@ class DSCAnalyzerApp(tk.Tk):
                 df_buf = self.data_state['buffer_raw']
                 self.ax.plot(df_buf['Temp'], df_buf['Signal'], label="Surowy sygnał (bufor)", alpha=0.7)
             self.ax.legend()
+            current_ylabel = "Sygnał [uW]"
 
         self.ax.set_title(title)
         self.ax.set_xlabel("Temperatura [°C]")
-        self.ax.set_ylabel("Sygnał")
+        self.ax.set_ylabel(current_ylabel)
         self.ax.grid(True)
-        #self.fig.text(0.5, 0.01, footer_text, ha='center', color='blue', fontsize=9)
         self._update_footer_text(footer_text, color="blue")
         self.fig.tight_layout(rect=[0, 0.03, 1, 1])
         self.canvas.draw()
@@ -511,12 +618,10 @@ class DSCAnalyzerApp(tk.Tk):
     def clear_temp_plot_elements(self, key=None):
         """Czyści tymczasowe elementy z wykresu."""
         if key:
-            # Czyści elementy tylko dla danego klucza (np. 'pre' lub 'post')
             for element in self.temp_plot_elements.get(key, []):
                 element.remove()
             self.temp_plot_elements[key] = []
         else:
-            # Czyści wszystkie tymczasowe elementy
             for key_ in self.temp_plot_elements:
                 for element in self.temp_plot_elements[key_]:
                     element.remove()
@@ -524,13 +629,8 @@ class DSCAnalyzerApp(tk.Tk):
 
         self.canvas.draw() if hasattr(self, 'canvas') else None
 
-    # Wklej w miejsce starej metody _update_temp_baseline_plot
-    # Wklej w miejsce starej metody _update_temp_baseline_plot
     def _update_temp_baseline_plot(self, mode):
         """Aktualizuje tymczasowy wykres linii bazowej (liniowej dla 2 pkt, kwadratowej dla 3)."""
-        # KROK 1: Usuń starą linię przerywaną, ale zostaw punkty (markery).
-        # ZMIANA: Wyszukujemy obiekty, które są liniami (mają styl '--'), a nie markerami (których styl linii to 'None').
-        # To jest kluczowa poprawka.
         elements_in_mode = self.temp_plot_elements.get(mode, [])
         old_lines = [el for el in elements_in_mode if isinstance(el, plt.Line2D) and el.get_linestyle() != 'None']
         for line in old_lines:
@@ -542,64 +642,50 @@ class DSCAnalyzerApp(tk.Tk):
             self.canvas.draw()
             return
 
-        # KROK 2: Dopasuj model (bez zmian)
         points = points[points[:, 0].argsort()]
         poly_deg = 1 if len(points) == 2 else 2
         p = np.polyfit(points[:, 0], points[:, 1], poly_deg)
 
-        # KROK 3: Narysuj nową linię przerywaną (bez zmian)
         x_fit = np.linspace(points[0, 0], points[-1, 0], 100)
         y_fit = np.polyval(p, x_fit)
         line, = self.ax.plot(x_fit, y_fit, 'r--')
         self.temp_plot_elements[mode].append(line)
 
-        # KROK 4: Zapisz parametry (bez zmian)
-        if len(points) == 3:
+        if len(points) >= 2:  # Zmieniono z ==3 na >=2, aby aktywować przyciski po wybraniu min. 2 punktów
             self.data_state['baseline_params'][mode] = {'points': points, 'poly': p}
             self.update_button_states()
 
         self.canvas.draw()
 
-    # NOWA METODA POMOCNICZA: Wklej ją w całości do klasy DSCAnalyzerApp
     def _update_footer_text(self, text="", color="blue"):
         """Usuwa stary tekst stopki i rysuje nowy, zarządzając jego obiektem."""
-        # Krok 1: Usuń poprzedni tekst, jeśli istnieje
         if self.footer_text_artist:
             self.footer_text_artist.remove()
 
-        # Krok 2: Stwórz nowy obiekt tekstowy i zapisz go w self.footer_text_artist
-        # Rysujemy tekst tylko wtedy, gdy nie jest pusty.
         if text:
-            # Czerwony tekst (ostrzeżenie/instrukcja) będzie miał tło dla lepszej widoczności
             bbox_props = dict(boxstyle='round', facecolor='white', alpha=0.8,
                               edgecolor=color) if color == 'red' else None
             self.footer_text_artist = self.fig.text(
                 0.5, 0.01, text, ha='center', color=color, fontsize=9, bbox=bbox_props
             )
         else:
-            # Jeśli tekst jest pusty, po prostu czyścimy referencję
             self.footer_text_artist = None
 
-        # Krok 3: Odśwież wykres
         self.canvas.draw_idle()
 
     def update_button_states(self):
         """Włącza/wyłącza przyciski w zależności od stanu analizy."""
         s = self.data_state
 
-        # Warunki włączania/wyłączania przycisków
         can_subtract_buffer = s['sample_raw'] is not None and s['buffer_raw'] is not None
         can_trim = s['subtracted'] is not None
         can_convert = s['trimmed'] is not None
         can_define_base = s['mhc'] is not None
         can_show_base = 'pre' in s['baseline_params'] and 'post' in s['baseline_params']
-        # Nowy stan "baseline_analysis" będzie tworzony przez funkcję 'show_baseline'
         can_subtract_base = s.get('baseline_analysis') is not None
-        # Nowy stan "peak_only" będzie tworzony przez funkcję 'subtract_baseline'
-        can_fit = s.get('peak_only') is not None
+        can_fit = s.get('baseline_subtracted') is not None  # Zmieniono z 'peak_only' na 'baseline_subtracted'
         can_save = any(value is not None for value in s.values())
 
-        # Ustawianie stanu przycisków
         self.btn_subtract['state'] = 'normal' if can_subtract_buffer else 'disabled'
         self.btn_trim['state'] = 'normal' if can_trim else 'disabled'
         self.btn_convert['state'] = 'normal' if can_convert else 'disabled'
@@ -609,6 +695,7 @@ class DSCAnalyzerApp(tk.Tk):
         self.btn_subtract_base['state'] = 'normal' if can_subtract_base else 'disabled'
         self.btn_fit['state'] = 'normal' if can_fit else 'disabled'
         self.btn_save['state'] = 'normal' if can_save else 'disabled'
+
 
 if __name__ == "__main__":
     app = DSCAnalyzerApp()

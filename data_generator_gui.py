@@ -48,13 +48,14 @@ class DataGeneratorApp(tk.Tk):
         self.param_vars = {}
 
         # --- Parametry modelu (pik) ---
+        # Zmieniono jednostki na J/mol i J/mol·K, aby były zgodne z dsc_models.py
         model_frame = ttk.LabelFrame(parent, text="Parametry Piku (Model Równowagowy)", padding="10")
         model_frame.pack(fill=tk.X, pady=5)
 
         params_model = {
-            "dH (cal/mol)": "100000.0",
+            "dH (J/mol)": "418400.0",  # Odpowiednik 100000 cal/mol
             "Tm (°C)": "70.0",
-            "dCp (cal/mol·K)": "1500.0"
+            "dCp (J/mol·K)": "6276.0"  # Odpowiednik 1500 cal/mol·K
         }
         for i, (text, default) in enumerate(params_model.items()):
             label = ttk.Label(model_frame, text=text)
@@ -62,16 +63,17 @@ class DataGeneratorApp(tk.Tk):
             var = tk.StringVar(self, value=default)
             entry = ttk.Entry(model_frame, textvariable=var, width=15)
             entry.grid(row=i, column=1, sticky=tk.EW, padx=5, pady=2)
-            self.param_vars[text.split(" ")[0]] = var  # Klucz to np. 'dH'
+            # Klucz to np. 'dH', ale bez jednostek, aby pasował do argumentów funkcji
+            self.param_vars[text.split(" ")[0]] = var
 
         # --- Parametry Linii Bazowej i Szumu ---
         base_frame = ttk.LabelFrame(parent, text="Linia Bazowa i Szum", padding="10")
         base_frame.pack(fill=tk.X, pady=5)
 
         params_base = {
-            "Offset (stała)": "5.0",
-            "Nachylenie liniowe": "0.1",
-            "Szum (std dev)": "0.5"
+            "Offset (J/mol·K)": "5.0", # Zmieniono etykietę na J/mol.K dla spójności
+            "Nachylenie liniowe (J/mol·K²/°C)": "0.1", # Doprecyzowano jednostki
+            "Szum (std dev) (J/mol·K)": "0.5" # Doprecyzowano jednostki
         }
         for i, (text, default) in enumerate(params_base.items()):
             label = ttk.Label(base_frame, text=text)
@@ -79,6 +81,7 @@ class DataGeneratorApp(tk.Tk):
             var = tk.StringVar(self, value=default)
             entry = ttk.Entry(base_frame, textvariable=var, width=15)
             entry.grid(row=i, column=1, sticky=tk.EW, padx=5, pady=2)
+            # Klucz to np. 'Offset' - używamy pierwszej części nazwy
             self.param_vars[text.split(" ")[0]] = var
 
         # --- Zakres danych ---
@@ -95,7 +98,8 @@ class DataGeneratorApp(tk.Tk):
             var = tk.StringVar(self, value=default)
             entry = ttk.Entry(range_frame, textvariable=var, width=15)
             entry.grid(row=i, column=1, sticky=tk.EW, padx=5, pady=2)
-            self.param_vars[text.replace('.', '')] = var  # Klucz to np. 'Temp min (°C)'
+            # Zmieniono klucze, aby usunąć spacje i znaki specjalne dla łatwiejszego dostępu
+            self.param_vars[text.replace('.', '').replace(' (°C)', '').replace(' ', '_').lower()] = var
 
         # --- Przyciski ---
         button_frame = ttk.Frame(parent, padding="10")
@@ -119,7 +123,8 @@ class DataGeneratorApp(tk.Tk):
 
         self.ax.set_title("Wygenerowany Termogram DSC")
         self.ax.set_xlabel("Temperatura [°C]")
-        self.ax.set_ylabel("Sygnał [jednostki arbitralne]")
+        # Zmieniono etykietę Y na bardziej specyficzną
+        self.ax.set_ylabel("Pojemność cieplna [J/(mol·K)] (arbitralne jednostki)")
         self.ax.grid(True)
         self.fig.tight_layout()
 
@@ -130,7 +135,7 @@ class DataGeneratorApp(tk.Tk):
             p = {key: float(var.get()) for key, var in self.param_vars.items()}
 
             # Stwórz wektor temperatury
-            T = np.linspace(p['Temp min (°C)'], p['Temp max (°C)'], 1000)
+            T = np.linspace(p['temp_min'], p['temp_max'], 1000)
 
             # Generuj sygnał z modelu równowagowego (bez dodatkowej linii bazowej)
             # Parametr 'baseline' w modelu to nasz 'Offset'
@@ -143,7 +148,8 @@ class DataGeneratorApp(tk.Tk):
             )
 
             # Dodaj dodatkowe nachylenie liniowe
-            linear_baseline_component = p['Nachylenie'] * (T - p['Temp min (°C)'])
+            # Używamy klucza 'Nachylenie' z pola wejściowego
+            linear_baseline_component = p['Nachylenie'] * (T - p['temp_min'])
             signal_with_slope = ideal_signal + linear_baseline_component
 
             # Dodaj szum
@@ -159,7 +165,8 @@ class DataGeneratorApp(tk.Tk):
             self.ax.plot(T, signal_with_slope, 'r--', label='Idealny sygnał (z linią bazową)', alpha=0.7)
             self.ax.set_title("Wygenerowany Termogram DSC")
             self.ax.set_xlabel("Temperatura [°C]")
-            self.ax.set_ylabel("Sygnał [j.a.]")
+            # Zmieniono etykietę Y na bardziej specyficzną
+            self.ax.set_ylabel("Pojemność cieplna [J/(mol·K)] (arbitralne jednostki)")
             self.ax.grid(True)
             self.ax.legend()
             self.fig.tight_layout()
