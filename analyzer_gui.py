@@ -526,6 +526,8 @@ class DSCAnalyzerApp(tk.Tk):
 
                         self._update_temp_baseline_plot(mode)
 
+    # Wklej do pliku analyzer_gui.py, zastępując istniejącą metodę update_plot
+
     def update_plot(self, title="", footer_text=""):
         self.clear_temp_plot_elements()
         self.ax.clear()
@@ -540,31 +542,60 @@ class DSCAnalyzerApp(tk.Tk):
             self.ax.legend()
             current_ylabel = "Pojemność cieplna [J/(mol·K)]"
 
+            # --- NOWA CZĘŚĆ: DODAWANIE POLA Z WYNIKAMI DOPASOWANIA ---
+            results = self.data_state.get('final_results')
+            if results:
+                params = results['parameters']
+                metrics = results['metrics']
+                model_name = self.model_var.get().replace('-', ' ').title()
+
+                text_lines = [f"Wyniki ({model_name}):"]
+
+                # Pętla po parametrach i ich formatowanie
+                for name, value in params.items():
+                    if 'dH [J/mol]' in name:
+                        text_lines.append(f"$\\Delta H$ = {value / 1000:.2f} kJ/mol")
+                    elif 'Ea [J/mol]' in name:
+                        text_lines.append(f"$E_a$ = {value / 1000:.2f} kJ/mol")
+                    elif 'Tm [°C]' in name:
+                        text_lines.append(f"$T_m$ = {value:.2f} °C")
+                    elif 'T* [°C]' in name:
+                        text_lines.append(f"$T^*$ = {value:.2f} °C")
+                    elif 'dCp [J/mol·K]' in name:
+                        # Sprawdzamy czy dCp było w ogóle fitowane
+                        if 'dCp [J/mol·K]' in self.data_state['final_results']['parameters']:
+                            text_lines.append(f"$\\Delta C_p$ = {value:.2f} J/mol·K")
+
+                # Dodanie metryk dopasowania
+                text_lines.append("---")
+                text_lines.append(f"$R^2$ = {metrics['r_squared']:.4f}")
+                text_lines.append(f"$\\chi^2_{{red}}$ = {metrics['reduced_chi_squared']:.3f}")
+
+                text_str = "\n".join(text_lines)
+
+                # Rysowanie pola tekstowego w lewym górnym rogu
+                self.ax.text(0.05, 0.95, text_str, transform=self.ax.transAxes, fontsize=10,
+                             verticalalignment='top', horizontalalignment='left',
+                             bbox=dict(boxstyle='round', facecolor='lightcyan', alpha=0.8))
+            # --- KONIEC NOWEJ CZĘŚCI ---
+
         elif self.data_state.get('baseline_subtracted') is not None:
             df = self.data_state['baseline_subtracted']
             self.ax.plot(df['Temp'], df['MHC_corr'], 'b-', label="Sygnał po odjęciu bazy")
 
-            # --- NOWA CZĘŚĆ: DODAWANIE POLA TEKSTOWEGO Z WYNIKAMI ---
             if self.data_state.get('final_thermo_params') is not None:
                 params = self.data_state['final_thermo_params']
-
-                # Pobieramy i formatujemy wartości (konwersja na kJ dla czytelności)
                 tm_val = params['Tm']
-                dcp_val_kj = params['dCp'] / 1000  # z J/mol·K na kJ/mol·K
-                dh_val_kj = params['dH_vH'] / 1000  # z J/mol na kJ/mol
-
-                # Tworzymy tekst z użyciem formatowania LaTeX
+                dcp_val_kj = params['dCp'] / 1000
+                dh_val_kj = params['dH_vH'] / 1000
                 text_str = (
                     f"$T_m$ = {tm_val:.2f} °C\n"
                     f"$\\Delta C_p$ = {dcp_val_kj:.2f} kJ/mol·K\n"
                     f"$\\Delta H_{{vH}}$ = {dh_val_kj:.2f} kJ/mol"
                 )
-
-                # Rysujemy pole tekstowe w prawym górnym rogu wykresu
                 self.ax.text(0.95, 0.95, text_str, transform=self.ax.transAxes, fontsize=11,
                              verticalalignment='top', horizontalalignment='right',
                              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
-            # --- KONIEC NOWEJ CZĘŚCI ---
 
             self.ax.legend(loc='lower center')
             current_ylabel = "Pojemność cieplna [J/(mol·K)]"
