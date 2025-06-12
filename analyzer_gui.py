@@ -32,8 +32,8 @@ class DSCAnalyzerApp(tk.Tk):
         self.data_state = {
             "sample_raw": None, "buffer_raw": None, "subtracted": None,
             "trimmed": None, "mhc": None, "baseline_subtracted": None,
-            # Zmieniono 'peak_only' na 'baseline_subtracted' dla spójności
-            "fit_curve": None, "final_results": None, "baseline_params": {}
+            "fit_curve": None, "final_results": None, "baseline_params": {},
+            "exclusion_range": None  # <-- DODANA LINIA
         }
         self.temp_plot_elements = {'pre': [], 'post': []}
         self.footer_text_artist = None
@@ -148,10 +148,16 @@ class DSCAnalyzerApp(tk.Tk):
 
         self.btn_fit = ttk.Button(frame4, text="Dopasuj model", command=self.fit_model)
         self.btn_fit.pack(fill=tk.X, pady=(5, 0))
-        # NOWY PRZYCISK - Wstawiony kod
+
+        # --- NOWY BLOK: WYKLUCZANIE DANYCH ---
+        self.btn_exclude_range = ttk.Button(frame4, text="Wyklucz/Zresetuj Zakres", command=self.enter_exclusion_mode)
+        self.btn_exclude_range.pack(fill=tk.X, pady=(5, 0))
+        self.lbl_exclusion_info = ttk.Label(frame4, text="Zakres wykluczony: Brak", style="Italic.TLabel")
+        self.lbl_exclusion_info.pack(fill=tk.X, pady=(2, 0))
+        # --- KONIEC NOWEGO BLOKU ---
+
         self.btn_show_residuals = ttk.Button(frame4, text="Pokaż pozostałość", command=self.show_residuals_plot)
         self.btn_show_residuals.pack(fill=tk.X, pady=(5, 0))
-        # KONIEC WSTAWIONEGO KODU
 
         # --- Sekcja 5: Zapis ---
         frame5 = ttk.LabelFrame(scrollable_frame, text="5. Zapis Wyników", padding=10)
@@ -392,9 +398,31 @@ class DSCAnalyzerApp(tk.Tk):
         self.update_plot("Pik po odjęciu linii bazowej")
         self.update_button_states()
 
+    # Wklej tę nową metodę do klasy DSCAnalyzerApp
+    def enter_exclusion_mode(self):
+        """Wchodzi w tryb wyboru zakresu do wykluczenia z fitowania lub resetuje go."""
+        if self.data_state.get('baseline_subtracted') is None:
+            messagebox.showerror("Błąd", "Najpierw odejmij linię bazową, aby zobaczyć pik do analizy.")
+            return
+
+        # Jeśli zakres już istnieje, zapytaj o jego usunięcie
+        if self.data_state['exclusion_range']:
+            if messagebox.askyesno("Reset Zakresu",
+                                   "Masz już zdefiniowany zakres do wykluczenia. Czy chcesz go usunąć?"):
+                self.data_state['exclusion_range'] = None
+                self.lbl_exclusion_info.config(text="Zakres wykluczony: Brak")
+                self.update_plot("Usunięto zakres wykluczenia")
+            return
+
+        # Wejście w tryb selekcji
+        self.selection_mode = 'exclude_range'
+        self.point_collector = []
+        self.clear_temp_plot_elements()
+        self.update_plot(self.ax.get_title(), "Wybierz 2 punkty (początek i koniec) zakresu do wykluczenia")
+        self._update_footer_text("Tryb wykluczania: Kliknij w dwóch miejscach, aby zdefiniować zakres.", color="red")
+
     def fit_model(self):
-        """Dopasowuje model do piku po odjęciu linii bazowej."""
-        # Używamy zmienionej nazwy klucza
+        """Dopasowuje model do piku po odjęciu linii bazowej, uwzględniając wykluczony zakres."""
         df = self.data_state.get('baseline_subtracted')
         if df is None:
             return messagebox.showerror("Błąd", "Najpierw odejmij linię bazową.")
@@ -402,20 +430,58 @@ class DSCAnalyzerApp(tk.Tk):
         model_name = self.model_var.get()
         if not model_name: return messagebox.showerror("Błąd", "Wybierz model do dopasowania.")
 
-        T = df['Temp'].values
-        Cpex = df['MHC_corr'].values  # Już w J/(mol·K), bez konwersji na cal
+        T_full = df['Temp'].values
+        Cpex_full = df['MHC_corr'].values
 
+        # --- NOWA LOGIKA: FILTROWANIE DANYCH PRZED FITOWANIEM ---
+        exclusion_range = self.data_state.get('exclusion_range')
+        if exclusion_range:
+            mask = (T_full < exclusion_range[0]) | (T_full > exclusion_range[1])
+            T_for_fit = T_full[mask]
+            Cpex_for_fit = Cpex_full[mask]
+            print(f"Fitowanie z wykluczeniem zakresu: {exclusion_range[0]:.1f}-{exclusion_range[1]:.1f} °C. "
+                  f"Użyto {len(T_for_fit)} z {len(T_full)} punktów.")
+        else:
+            T_for_fit = T_full
+            Cpex_for_fit = Cpex_full
+            print("Fitowanie na pełnym zakresie danych.")
+        # --- KONIEC NOWEJ LOGIKI ---
+
+        # --- NOWY BLOK: ZAPIS DANYCH UŻYTYCH DO FITOWANIA ---
+        self.data_state['data_for_fit'] = pd.DataFrame({
+            'Temp': T_for_fit,
+            'MHC_corr_fit': Cpex_for_fit
+        })
+            # --- KONIEC NOWEGO BLOKU ---
         fit_function_map = {
             'equilibrium': dsc_models.fit_equilibrium,
             'lumry-eyring': lambda t, y: dsc_models.fit_lumry_eyring(t, y, float(self.param_vars['rate_cpmin'].get())),
             'irreversible': lambda t, y: dsc_models.fit_irreversible(t, y, float(self.param_vars['rate_cpmin'].get()))
         }
 
-        params, metrics, fit_curve_J = fit_function_map[model_name](T, Cpex)  # fit_curve_J jest już w J/(mol·K)
+        # Wywołujemy dopasowanie na potencjalnie przefiltrowanych danych
+        params, metrics, _ = fit_function_map[model_name](T_for_fit, Cpex_for_fit)
 
-        if params is None: return  # Błąd dopasowania już został wyświetlony
+        if params is None:
+            messagebox.showerror("Błąd dopasowania",
+                                 "Nie udało się dopasować modelu. Sprawdź parametry lub dane wejściowe.")
+            return
 
-        self.data_state['fit_curve'] = pd.DataFrame({'Temp': T, 'Fit': fit_curve_J})
+        # --- NOWA LOGIKA: ODTWORZENIE KRZYWEJ NA PEŁNYM ZAKRESIE ---
+        # Po uzyskaniu parametrów z dopasowania, generujemy krzywą teoretyczną
+        # na pełnym, oryginalnym zakresie temperatur, aby móc ją porównać z wszystkimi danymi.
+        rate = float(self.param_vars['rate_cpmin'].get())
+        if model_name == 'equilibrium':
+            fit_curve_full_range = dsc_models.model_equilibrium(T_full, *params.values())
+        elif model_name == 'lumry-eyring':
+            fit_curve_full_range = dsc_models.model_lumry_eyring(T_full, *params.values(), rate)
+        elif model_name == 'irreversible':
+            fit_curve_full_range = dsc_models.model_irreversible(T_full, *params.values(), rate)
+        else:
+            fit_curve_full_range = np.zeros_like(T_full)  # Fallback
+        # --- KONIEC NOWEJ LOGIKI ---
+
+        self.data_state['fit_curve'] = pd.DataFrame({'Temp': T_full, 'Fit': fit_curve_full_range})
         self.data_state['final_results'] = {'parameters': params, 'metrics': metrics}
 
         self.update_plot("Wynik dopasowania modelu")
@@ -430,28 +496,35 @@ class DSCAnalyzerApp(tk.Tk):
 
         try:
             with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
-                if self.data_state['sample_raw'] is not None:
-                    self.data_state['sample_raw'].to_excel(writer, sheet_name='Dane Surowe (Próbka)', index=False)
-                if self.data_state['buffer_raw'] is not None:
-                    self.data_state['buffer_raw'].to_excel(writer, sheet_name='Dane Surowe (Bufor)', index=False)
-                if self.data_state['subtracted'] is not None:
-                    self.data_state['subtracted'].to_excel(writer, sheet_name='Po odjęciu bufora', index=False)
-                if self.data_state['trimmed'] is not None:
-                    self.data_state['trimmed'].to_excel(writer, sheet_name='Po przycięciu', index=False)
-                if self.data_state['mhc'] is not None:
-                    self.data_state['mhc'].to_excel(writer, sheet_name='Molowa Pojemnosc Cieplna', index=False)
-                # Zmieniono klucz dostępu do danych
-                if self.data_state.get('baseline_subtracted') is not None:
-                    self.data_state['baseline_subtracted'].to_excel(writer, sheet_name='Pik po odjeciu bazy',
-                                                                    index=False)  # Zmieniono nazwę arkusza
-                if self.data_state['fit_curve'] is not None:
-                    self.data_state['fit_curve'].to_excel(writer, sheet_name='Dopasowany model', index=False)
+                # --- Arkusz 1: Parametry Analizy (NOWOŚĆ) ---
+                params_dict = {
+                    "Parametr": [],
+                    "Wartość": []
+                }
+                # Dodaj parametry obliczeniowe
+                for key, var in self.param_vars.items():
+                    params_dict["Parametr"].append(key)
+                    params_dict["Wartość"].append(var.get())
+                # Dodaj informacje o modelu i wykluczeniu
+                if self.data_state['final_results']:
+                    params_dict["Parametr"].append("Użyty model")
+                    params_dict["Wartość"].append(self.model_var.get())
+                if self.data_state.get('exclusion_range'):
+                    er = self.data_state['exclusion_range']
+                    params_dict["Parametr"].append("Zakres wykluczony [°C]")
+                    params_dict["Wartość"].append(f"{er[0]:.2f} - {er[1]:.2f}")
+                else:
+                    params_dict["Parametr"].append("Zakres wykluczony [°C]")
+                    params_dict["Wartość"].append("Brak")
+
+                pd.DataFrame(params_dict).to_excel(writer, sheet_name='Parametry Analizy', index=False)
+
+                # --- Arkusz 2: Wyniki Końcowe ---
                 if self.data_state['final_results'] is not None:
                     params_df = pd.DataFrame.from_dict(self.data_state['final_results']['parameters'], orient='index',
                                                        columns=['Wartość'])
                     metrics_df = pd.DataFrame.from_dict(self.data_state['final_results']['metrics'], orient='index',
                                                         columns=['Wartość'])
-                    # Konwersja parametrów DH i Ea do kJ/mol dla raportu
                     report_params_df = params_df.copy()
                     if 'dH [J/mol]' in report_params_df.index:
                         report_params_df.loc['dH [kJ/mol]'] = report_params_df.loc['dH [J/mol]'] / 1000
@@ -460,17 +533,55 @@ class DSCAnalyzerApp(tk.Tk):
                         report_params_df.loc['Ea [kJ/mol]'] = report_params_df.loc['Ea [J/mol]'] / 1000
                         report_params_df = report_params_df.drop(index='Ea [J/mol]')
 
-                    combined_df = pd.concat([report_params_df, metrics_df])  # Używamy przekonwertowanych parametrów
+                    final_summary_df = pd.concat([report_params_df, metrics_df])
 
-                    # Dodaj wyniki Tm i dCp z analizy linii bazowej, jeśli dostępne
-                    if 'delta_cp_result' in self.data_state and self.data_state['delta_cp_result'] is not None:
-                        dcp_res = self.data_state['delta_cp_result']
-                        dcp_df = pd.DataFrame({
-                            'Wartość': [dcp_res['Tm'], dcp_res['dCp'] / 1000]  # dCp do kJ/molK
-                        }, index=['Tm (baseline) [°C]', 'ΔCp (baseline) [kJ/mol·K]'])
-                        combined_df = pd.concat([combined_df, dcp_df])
+                    if 'final_thermo_params' in self.data_state and self.data_state['final_thermo_params'] is not None:
+                        thermo_params = self.data_state['final_thermo_params']
+                        thermo_df = pd.DataFrame({
+                            'Wartość': [thermo_params['Tm'], thermo_params['dCp'] / 1000, thermo_params['dH_vH'] / 1000]
+                        }, index=['Tm (baseline) [°C]', 'ΔCp (baseline) [kJ/mol·K]', 'ΔH_vH (baseline) [kJ/mol]'])
+                        final_summary_df = pd.concat([final_summary_df, thermo_df])
 
-                    combined_df.to_excel(writer, sheet_name='Wyniki Końcowe (Dopasowanie)')
+                    final_summary_df.to_excel(writer, sheet_name='Wyniki Końcowe')
+
+                # --- Arkusze z Danymi z kolejnych etapów ---
+                if self.data_state['sample_raw'] is not None:
+                    self.data_state['sample_raw'].to_excel(writer, sheet_name='1_Dane_Surowe_Probka', index=False)
+                if self.data_state['buffer_raw'] is not None:
+                    self.data_state['buffer_raw'].to_excel(writer, sheet_name='2_Dane_Surowe_Bufor', index=False)
+                if self.data_state['subtracted'] is not None:
+                    self.data_state['subtracted'].to_excel(writer, sheet_name='3_Po_Odjeciu_Bufora', index=False)
+                if self.data_state['trimmed'] is not None:
+                    self.data_state['trimmed'].to_excel(writer, sheet_name='4_Po_Przycieciu', index=False)
+                if self.data_state['mhc'] is not None:
+                    self.data_state['mhc'].to_excel(writer, sheet_name='5_MHC', index=False)
+
+                # --- Arkusz: Analiza Linii Bazowej (NOWOŚĆ) ---
+                if self.data_state.get('baseline_analysis') is not None:
+                    self.data_state['baseline_analysis'].to_excel(writer, sheet_name='6_Analiza_Linii_Bazowej',
+                                                                  index=False)
+
+                if self.data_state.get('baseline_subtracted') is not None:
+                    self.data_state['baseline_subtracted'].to_excel(writer, sheet_name='7_Pik_Po_Odjeciu_Bazy',
+                                                                    index=False)
+
+                # --- Arkusz: Dane do Fitu (NOWOŚĆ) ---
+                if self.data_state.get('data_for_fit') is not None:
+                    self.data_state['data_for_fit'].to_excel(writer, sheet_name='8_Dane_Do_Fitu', index=False)
+
+                # --- Arkusz: Dopasowanie z Residuami (ZMODYFIKOWANY) ---
+                if self.data_state.get('fit_curve') is not None and self.data_state.get(
+                        'baseline_subtracted') is not None:
+                    df_fit = self.data_state['fit_curve'].copy()
+                    df_peak = self.data_state['baseline_subtracted']
+                    # Dopasowanie danych w osi X do siebie przed obliczeniem residuów
+                    merged_df = pd.merge(df_peak, df_fit, on='Temp', how='left')
+                    merged_df['Residuals'] = merged_df['MHC_corr'] - merged_df['Fit']
+                    # Zapisujemy tylko Temp, MHC_corr, Fit i Residuals
+                    merged_df[['Temp', 'MHC_corr', 'Fit', 'Residuals']].to_excel(writer,
+                                                                                 sheet_name='9_Dopasowanie_i_Residua',
+                                                                                 index=False)
+
             messagebox.showinfo("Sukces", f"Zapisano raport w pliku:\n{filepath}")
         except Exception as e:
             messagebox.showerror("Błąd zapisu", f"Nie udało się zapisać raportu: {e}")
@@ -497,6 +608,21 @@ class DSCAnalyzerApp(tk.Tk):
                     self.update_plot("Po ograniczeniu zakresu temperatur")
                     self.update_button_states()
             return
+
+        if self.selection_mode == 'exclude_range':
+            if event.button == 1:
+                self.point_collector.append(event.xdata)
+                pt, = self.ax.plot(event.xdata, event.ydata, 'mo', markersize=8)  # 'm' to magenta
+                self.temp_plot_elements['pre'].append(pt)
+                self.canvas.draw()
+                if len(self.point_collector) == 2:
+                    temps = sorted(self.point_collector)
+                    self.data_state['exclusion_range'] = temps
+                    self.selection_mode = None
+                    self.lbl_exclusion_info.config(text=f"Wykluczono: {temps[0]:.1f} - {temps[1]:.1f} °C")
+                    self.update_plot("Zdefiniowano zakres do wykluczenia")
+                    self._update_footer_text("")
+            return  # Ważne, aby zakończyć działanie metody tutaj
 
         if self.selection_mode in ['baseline_pre', 'baseline_post']:
             mode = self.selection_mode.split('_')[1]
@@ -552,6 +678,12 @@ class DSCAnalyzerApp(tk.Tk):
             df_fit = self.data_state['fit_curve']
             self.ax.plot(df_peak['Temp'], df_peak['MHC_corr'], 'ro', markersize=3, alpha=0.6, label="Dane")
             self.ax.plot(df_fit['Temp'], df_fit['Fit'], 'b-', linewidth=2, label="Dopasowany model")
+            # --- NOWA LINIA: WIZUALIZACJA WYKLUCZONEGO ZAKRESU ---
+            exclusion_range = self.data_state.get('exclusion_range')
+            if exclusion_range:
+                self.ax.axvspan(exclusion_range[0], exclusion_range[1], color='gray', alpha=0.3,
+                                label='Zakres wykluczony')
+            # --- KONIEC NOWEJ LINII ---
             self.ax.legend()
             current_ylabel = "Pojemność cieplna [J/(mol·K)]"
 
@@ -687,6 +819,8 @@ class DSCAnalyzerApp(tk.Tk):
         for key in keys_to_reset:
             if key in self.data_state:
                 self.data_state[key] = None
+        self.data_state['exclusion_range'] = None
+        self.lbl_exclusion_info.config(text="Zakres wykluczony: Brak")
 
         # Resetowanie parametrów linii bazowej
         self.data_state['baseline_params'] = {}
@@ -708,10 +842,13 @@ class DSCAnalyzerApp(tk.Tk):
         analizy i resetuje etykiety plików.
         """
         # Przywrócenie słownika data_state do stanu początkowego
+        # --- Inicjalizacja stanu danych ---
         self.data_state = {
             "sample_raw": None, "buffer_raw": None, "subtracted": None,
             "trimmed": None, "mhc": None, "baseline_subtracted": None,
-            "fit_curve": None, "final_results": None, "baseline_params": {}
+            # Zmieniono 'peak_only' na 'baseline_subtracted' dla spójności
+            "fit_curve": None, "final_results": None, "baseline_params": {},
+            "exclusion_range": None  # <-- KLUCZOWA DODANA LINIA
         }
         # Resetowanie dodatkowych stanów, jeśli istnieją
         if 'baseline_analysis' in self.data_state:
