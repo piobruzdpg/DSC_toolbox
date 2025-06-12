@@ -86,6 +86,16 @@ class DSCAnalyzerApp(tk.Tk):
         self.btn_subtract = ttk.Button(frame1, text="Odejmij bufor", command=self.subtract_buffer)
         self.btn_subtract.grid(row=4, column=0, sticky=tk.EW, columnspan=2, pady=(10, 0))
 
+        # PRZENIESIONY PRZYCISK - Wstawiony kod
+        self.btn_trim = ttk.Button(frame1, text="Ogranicz zakres temperatur", command=self.enter_trim_mode)
+        self.btn_trim.grid(row=5, column=0, sticky=tk.EW, columnspan=2, pady=(10, 0))
+        # KONIEC WSTAWIONEGO KODU
+
+        # NOWY PRZYCISK - Wstawiony kod
+        self.btn_reset = ttk.Button(frame1, text="Resetuj", command=self.reset_analysis)
+        self.btn_reset.grid(row=6, column=0, sticky=tk.EW, columnspan=2, pady=(5, 0))
+        # KONIEC WSTAWIONEGO KODU
+
         # --- Sekcja 2: Parametry Obliczeniowe ---
         frame2 = ttk.LabelFrame(scrollable_frame, text="2. Parametry Obliczeniowe", padding=10)
         frame2.pack(fill=tk.X, padx=5, pady=5)
@@ -107,9 +117,6 @@ class DSCAnalyzerApp(tk.Tk):
         # --- Sekcja 3: Przetwarzanie i Analiza ---
         frame3 = ttk.LabelFrame(scrollable_frame, text="3. Kroki Analizy", padding=10)
         frame3.pack(fill=tk.X, padx=5, pady=5)
-
-        self.btn_trim = ttk.Button(frame3, text="Ogranicz zakres temperatur", command=self.enter_trim_mode)
-        self.btn_trim.pack(fill=tk.X, pady=2)
 
         self.btn_convert = ttk.Button(frame3, text="Konwertuj na Molową Poj. Cieplną", command=self.convert_to_mhc)
         self.btn_convert.pack(fill=tk.X, pady=2)
@@ -141,6 +148,10 @@ class DSCAnalyzerApp(tk.Tk):
 
         self.btn_fit = ttk.Button(frame4, text="Dopasuj model", command=self.fit_model)
         self.btn_fit.pack(fill=tk.X, pady=(5, 0))
+        # NOWY PRZYCISK - Wstawiony kod
+        self.btn_show_residuals = ttk.Button(frame4, text="Pokaż pozostałość", command=self.show_residuals_plot)
+        self.btn_show_residuals.pack(fill=tk.X, pady=(5, 0))
+        # KONIEC WSTAWIONEGO KODU
 
         # --- Sekcja 5: Zapis ---
         frame5 = ttk.LabelFrame(scrollable_frame, text="5. Zapis Wyników", padding=10)
@@ -184,9 +195,11 @@ class DSCAnalyzerApp(tk.Tk):
             messagebox.showerror("Błąd odczytu pliku", f"Nie udało się wczytać pliku: {e}")
 
     def load_sample(self):
+        self._reset_all_state_for_new_sample()  # <-- DODANA LINIA
         self.load_file("sample_raw")
 
     def load_buffer(self):
+        self._reset_state_for_new_buffer()  # <-- DODANA LINIA
         self.load_file("buffer_raw")
 
     def subtract_buffer(self):
@@ -646,6 +659,107 @@ class DSCAnalyzerApp(tk.Tk):
         self.fig.tight_layout(rect=[0, 0.03, 1, 1])
         self.canvas.draw()
 
+        # NOWA METODA - Wstawiony kod
+    def reset_analysis(self):
+        """Resetuje stan analizy do etapu po odjęciu bufora."""
+        if self.data_state.get('subtracted') is None:
+            messagebox.showwarning("Brak danych", "Nie ma stanu do zresetowania.")
+            return
+
+        # Okno dialogowe z prośbą o potwierdzenie
+        response = messagebox.askyesno(
+            "Potwierdzenie resetu",
+            "Czy na pewno chcesz zresetować analizę?\n\n"
+            "Wszystkie kroki po odjęciu bufora (przycinanie, konwersja, definicja bazy, dopasowanie) zostaną utracone.",
+            icon='warning'
+        )
+
+        if not response:
+            return  # Użytkownik anulował reset
+
+        # Klucze stanu do zresetowania
+        keys_to_reset = [
+            "trimmed", "mhc", "baseline_subtracted", "fit_curve",
+            "final_results", "baseline_analysis", "delta_cp_result",
+            "final_thermo_params"
+        ]
+
+        for key in keys_to_reset:
+            if key in self.data_state:
+                self.data_state[key] = None
+
+        # Resetowanie parametrów linii bazowej
+        self.data_state['baseline_params'] = {}
+
+        # Wyczyszczenie tymczasowych elementów z wykresu (np. punktów bazy)
+        self.clear_temp_plot_elements()
+
+        # Zaktualizowanie interfejsu
+        self.update_plot("Zresetowano do etapu po odjęciu bufora")
+        self.update_button_states()
+
+        messagebox.showinfo("Sukces", "Analiza została zresetowana.")
+    # KONIEC WSTAWIONEGO KODU
+
+        # NOWA METODA - Wstawiony kod
+    def _reset_all_state_for_new_sample(self):
+        """
+        Całkowicie resetuje stan aplikacji. Czyści wszystkie dane,
+        analizy i resetuje etykiety plików.
+        """
+        # Przywrócenie słownika data_state do stanu początkowego
+        self.data_state = {
+            "sample_raw": None, "buffer_raw": None, "subtracted": None,
+            "trimmed": None, "mhc": None, "baseline_subtracted": None,
+            "fit_curve": None, "final_results": None, "baseline_params": {}
+        }
+        # Resetowanie dodatkowych stanów, jeśli istnieją
+        if 'baseline_analysis' in self.data_state:
+            self.data_state['baseline_analysis'] = None
+        if 'delta_cp_result' in self.data_state:
+            self.data_state['delta_cp_result'] = None
+        if 'final_thermo_params' in self.data_state:
+            self.data_state['final_thermo_params'] = None
+
+        # Zresetowanie etykiet plików w GUI
+        self.lbl_sample_file.config(text="Nie wczytano pliku.")
+        self.lbl_buffer_file.config(text="Nie wczytano pliku.")
+
+        # Wyczyszczenie tymczasowych elementów z wykresu
+        self.clear_temp_plot_elements()
+
+        # Zresetowanie trybu selekcji
+        self.selection_mode = None
+
+        # NOWA METODA - Wstawiony kod
+    def _reset_state_for_new_buffer(self):
+        """
+        Resetuje stan analizy, zachowując dane próbki, ale czyszcząc
+        stary bufor i wszystkie kolejne kroki analizy.
+        """
+        # Klucze do zresetowania - nie ruszamy 'sample_raw'
+        keys_to_reset = [
+            "buffer_raw", "subtracted", "trimmed", "mhc",
+            "baseline_subtracted", "fit_curve", "final_results",
+            "baseline_analysis", "delta_cp_result", "final_thermo_params"
+        ]
+
+        for key in keys_to_reset:
+            if key in self.data_state:
+                self.data_state[key] = None
+
+        # Resetowanie parametrów linii bazowej
+        self.data_state['baseline_params'] = {}
+
+        # Zresetowanie tylko etykiety pliku bufora
+        self.lbl_buffer_file.config(text="Nie wczytano pliku.")
+
+        # Wyczyszczenie tymczasowych elementów z wykresu
+        self.clear_temp_plot_elements()
+
+        # Zresetowanie trybu selekcji
+        self.selection_mode = None
+
     def clear_temp_plot_elements(self, key=None):
         """Czyści tymczasowe elementy z wykresu."""
         if key:
@@ -709,16 +823,19 @@ class DSCAnalyzerApp(tk.Tk):
         s = self.data_state
 
         can_subtract_buffer = s['sample_raw'] is not None and s['buffer_raw'] is not None
+        can_reset = s['trimmed'] is not None  # NOWA LINIA
         can_trim = s['subtracted'] is not None
         can_convert = s['trimmed'] is not None
         can_define_base = s['mhc'] is not None
         can_show_base = 'pre' in s['baseline_params'] and 'post' in s['baseline_params']
         can_subtract_base = s.get('baseline_analysis') is not None
         can_fit = s.get('baseline_subtracted') is not None  # Zmieniono z 'peak_only' na 'baseline_subtracted'
+        can_show_residuals = s.get('fit_curve') is not None  # NOWA LINIA
         can_save = any(value is not None for value in s.values())
 
         self.btn_subtract['state'] = 'normal' if can_subtract_buffer else 'disabled'
         self.btn_trim['state'] = 'normal' if can_trim else 'disabled'
+        self.btn_reset['state'] = 'normal' if can_reset else 'disabled'  # NOWA LINIA
         self.btn_convert['state'] = 'normal' if can_convert else 'disabled'
         self.btn_base_pre['state'] = 'normal' if can_define_base else 'disabled'
         self.btn_base_post['state'] = 'normal' if can_define_base else 'disabled'
@@ -726,6 +843,54 @@ class DSCAnalyzerApp(tk.Tk):
         self.btn_subtract_base['state'] = 'normal' if can_subtract_base else 'disabled'
         self.btn_fit['state'] = 'normal' if can_fit else 'disabled'
         self.btn_save['state'] = 'normal' if can_save else 'disabled'
+        # NOWA LINIA - Wstawiony kod
+        self.btn_show_residuals['state'] = 'normal' if can_show_residuals else 'disabled'
+        # KONIEC WSTAWIONEGO KODU
+
+# NOWA METODA - Wstawiony kod
+    def show_residuals_plot(self):
+        """Tworzy nowe okno i rysuje w nim wykres pozostałości."""
+        df_peak = self.data_state.get('baseline_subtracted')
+        df_fit = self.data_state.get('fit_curve')
+
+        if df_peak is None or df_fit is None:
+            messagebox.showwarning("Brak danych", "Aby pokazać pozostałości, najpierw dopasuj model.")
+            return
+
+        # Utworzenie nowego okna (Toplevel)
+        residual_window = tk.Toplevel(self)
+        residual_window.title("Wykres Pozostałości")
+        residual_window.geometry("800x600")
+
+        # Utworzenie figury i osi dla wykresu
+        fig, ax = plt.subplots(figsize=(7, 5))
+
+        # Obliczenie pozostałości
+        temperature = df_peak['Temp'].values
+        residuals = df_peak['MHC_corr'].values - df_fit['Fit'].values
+
+        # Rysowanie danych
+        ax.plot(temperature, residuals, 'o-', markersize=3, label="Pozostałości (dane - model)")
+        ax.axhline(0, color='red', linestyle='--', linewidth=1.5, label="Linia zerowa")
+
+        # Ustawienia wykresu
+        ax.set_title("Pozostałości po dopasowaniu modelu")
+        ax.set_xlabel("Temperatura [°C]")
+        ax.set_ylabel("Różnica [J/(mol·K)]")
+        ax.grid(True)
+        ax.legend()
+        fig.tight_layout()
+
+        # Osadzenie wykresu w oknie Tkinter
+        canvas = FigureCanvasTkAgg(fig, master=residual_window)
+        canvas.draw()
+        canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        # Dodanie paska narzędzi Matplotlib
+        toolbar = NavigationToolbar2Tk(canvas, residual_window)
+        toolbar.update()
+        canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+    # KONIEC WSTAWIONEGO KODU
 
 
 if __name__ == "__main__":
